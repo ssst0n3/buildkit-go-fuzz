@@ -100,3 +100,7 @@ docs:
 .PHONY: mod-outdated
 mod-outdated:
 	$(BUILDX_CMD) bake mod-outdated
+
+.PHONY: fuzz
+fuzz:
+	docker run -tid -v $(pwd):/go/src/github.com/moby/buildkit/ -w /go/src/github.com/moby/buildkit/ golang:1.25 go test ./exporter/containerimage -fuzz=FuzzPatchImageConfig
