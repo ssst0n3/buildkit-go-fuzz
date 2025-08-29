@@ -10,6 +10,7 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/plugins/content/local"
+	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	"github.com/moby/buildkit/session"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/solver"
@@ -60,10 +61,15 @@ func FuzzCommitDistributionManifest(f *testing.F) {
 		baseImgDiffIDData []byte,
 	) {
 		// --- 測試設置 ---
-		store, err := local.NewStore("/test")
+
+		// **修正點**: 使用 t.TempDir() 為每次 Fuzz 迭代創建一個獨立的臨時目錄。
+		// 這可以防止並行執行時發生文件系統衝突，確保測試的隔離性和健壯性。
+		tempDir := t.TempDir()
+		store, err := local.NewStore(tempDir)
 		if err != nil {
-			t.Fatalf("failed to create local store: %v", err)
+			t.Fatalf("failed to create local store in temp dir %s: %v", tempDir, err)
 		}
+
 		cs := containerdsnapshot.NewContentStore(store, "buildkit")
 		// 創建 ImageWriter 實例
 		ic, err := NewImageWriter(WriterOpt{
@@ -137,5 +143,96 @@ func FuzzCommitDistributionManifest(f *testing.F) {
 			sg,
 			baseImg,
 		)
+	})
+}
+
+// FuzzCommitAttestationsManifest 是针对 commitAttestationsManifest 函数的模糊测试。
+// 它的目标是发现任何可能导致程序崩溃（panic）的输入组合。
+func FuzzCommitAttestationsManifest(f *testing.F) {
+	// --- 1. 设置种子语料库 (Seed Corpus) ---
+	// 这些种子为模糊测试引擎提供了有效的初始输入，以引导其进行变异。
+
+	// 种子 1: 一个基本的有效证明，采用非 OCI Artifact 风格。
+	seedTarget1 := ocispecs.Descriptor{
+		MediaType: ocispecs.MediaTypeImageManifest,
+		Digest:    "sha256:f54a5821fe5da5435027544002392690d8e40c59292a24e47c32888497a89e83",
+		Size:      708,
+	}
+	seedStatements1 := []intoto.Statement{
+		{
+			StatementHeader: intoto.StatementHeader{
+				Type:          intoto.StatementInTotoV01,
+				PredicateType: "https://example.com/my-predicate/v1",
+				Subject: []intoto.Subject{
+					{
+						Name: "pkg:docker/hello-world@sha256:f54a5821fe5da5435027544002392690d8e40c59292a24e47c32888497a89e83",
+						Digest: map[string]string{
+							"sha256": "f54a5821fe5da5435027544002392690d8e40c59292a24e47c32888497a89e83",
+						},
+					},
+				},
+			},
+			Predicate: json.RawMessage(`{"key":"value"}`),
+		},
+	}
+	targetJSON1, _ := json.Marshal(seedTarget1)
+	statementsJSON1, _ := json.Marshal(seedStatements1)
+	f.Add(targetJSON1, statementsJSON1, false, true) // ociArtifact=false, ociTypes=true
+
+	// 种子 2: 包含两个证明，采用 OCI Artifact 风格。
+	seedStatements2 := append(seedStatements1, intoto.Statement{
+		StatementHeader: intoto.StatementHeader{
+			Type:          intoto.StatementInTotoV01,
+			PredicateType: "https://example.com/another-predicate/v1",
+		},
+		Predicate: json.RawMessage(`{"foo":"bar"}`),
+	})
+	statementsJSON2, _ := json.Marshal(seedStatements2)
+	f.Add(targetJSON1, statementsJSON2, true, true) // ociArtifact=true, ociTypes=true
+
+	// 种子 3: 证明列表为空数组 `[]`。
+	f.Add(targetJSON1, []byte("[]"), false, false)
+
+	// 种子 4: 证明列表为 `null`。
+	f.Add(targetJSON1, []byte("null"), true, false)
+
+	// --- 2. 定义 Fuzzing 目标函数 ---
+	// 这是模糊测试的核心逻辑，它会使用引擎生成的随机数据来执行测试。
+	f.Fuzz(func(t *testing.T, targetJSON []byte, statementsJSON []byte, ociArtifact bool, ociTypes bool) {
+		tempDir := t.TempDir()
+		store, err := local.NewStore(tempDir)
+		if err != nil {
+			t.Fatalf("failed to create local store in temp dir %s: %v", tempDir, err)
+		}
+		iw, err := NewImageWriter(WriterOpt{
+			ContentStore: store,
+			// Snapshotter, Applier, 和 Differ 在 commitAttestationsManifest 中未使用，
+			// 因此可以安全地将它们设置为 nil。
+		})
+		if err != nil {
+			t.Fatalf("创建 ImageWriter 失败: %v", err)
+		}
+
+		// b. 反序列化 Fuzzing 引擎提供的随机数据。
+		// 如果数据不是有效的 JSON，则跳过本次迭代。我们的目标是测试函数逻辑，而非 JSON 解析器。
+		var target ocispecs.Descriptor
+		if err := json.Unmarshal(targetJSON, &target); err != nil {
+			t.Skip()
+		}
+
+		var statements []intoto.Statement
+		if err := json.Unmarshal(statementsJSON, &statements); err != nil {
+			t.Skip()
+		}
+
+		// c. 根据 Fuzzing 输入设置选项。
+		opts := &ImageCommitOpts{
+			OCITypes: ociTypes,
+		}
+
+		// d. 调用被测试的函数。
+		// Fuzzing 框架会自动捕获任何由此调用引发的 panic。
+		// 我们不需要检查返回的描述符或错误，因为测试的目标是发现崩溃。
+		_, _ = iw.commitAttestationsManifest(context.Background(), opts, target, statements, ociArtifact)
 	})
 }
