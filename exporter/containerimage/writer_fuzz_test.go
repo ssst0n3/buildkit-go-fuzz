@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"math/rand"
 	"testing"
 	"time"
 
@@ -11,7 +12,10 @@ import (
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/plugins/content/local"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
+	"github.com/moby/buildkit/exporter"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/snapshot"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/solver"
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
@@ -234,5 +238,94 @@ func FuzzCommitAttestationsManifest(f *testing.F) {
 		// Fuzzing 框架会自动捕获任何由此调用引发的 panic。
 		// 我们不需要检查返回的描述符或错误，因为测试的目标是发现崩溃。
 		_, _ = iw.commitAttestationsManifest(context.Background(), opts, target, statements, ociArtifact)
+	})
+}
+
+type nopSnapshotter struct{ snapshot.Snapshotter }
+type nopApplier struct{}
+
+// --- 2. 随机工具 ------------------------------------------------------------
+
+func randBool(r *rand.Rand) bool { return r.Intn(2) == 0 }
+
+// 返回 0~n-1
+func randN(r *rand.Rand, n int) int { return r.Intn(n) }
+
+// 生成若干随机平台标识
+func randomPlatforms(r *rand.Rand) []string {
+	all := []string{
+		"linux/amd64", "linux/arm64/v8", "windows/amd64", "linux/s390x",
+	}
+	// 随机取 1~len(all) 个
+	num := r.Intn(len(all)) + 1
+	r.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
+	return all[:num]
+}
+
+func FuzzCommit(f *testing.F) {
+	// 多样 seed，可直接触发一些错误返回
+	f.Add([]byte(`{}`))                    // 空 config
+	f.Add([]byte(`invalid-json`))          // 非法 config
+	f.Add(bytes.Repeat([]byte{'a'}, 9000)) // 大尺寸 config
+	f.Add([]byte(`{"history":[{"empty_layer":true}]}`))
+
+	f.Fuzz(func(t *testing.T, cfg []byte) {
+		// 确保 fuzz 崩溃不会杀掉整个进程
+		defer func() {
+			if v := recover(); v != nil {
+				t.Errorf("panic: %v", v)
+			}
+		}()
+
+		r := rand.New(rand.NewSource(int64(time.Now().UnixNano())))
+
+		// 1. content store
+		tempDir := t.TempDir()
+		store, err := local.NewStore(tempDir)
+		if err != nil {
+			t.Fatalf("failed to create local store in temp dir %s: %v", tempDir, err)
+		}
+
+		// 2. ImageWriter
+		iw, _ := NewImageWriter(WriterOpt{
+			ContentStore: store,
+			Snapshotter:  &nopSnapshotter{},
+		})
+
+		// 3. 随机 platforms / refs
+		plats := randomPlatforms(r)
+		platMap := map[string]exptypes.Platforms{}
+		refs := map[string]struct{}{} // 这里只需要 map key 占位
+		for _, p := range plats {
+			platMap[p] = exptypes.Platforms{}
+			refs[p] = struct{}{}
+		}
+		platBytes, _ := json.Marshal(map[string]any{"platforms": platMap})
+
+		// 4. exporter.Source
+		src := &exporter.Source{
+			Metadata: map[string][]byte{
+				exptypes.ExporterImageConfigKey: cfg,
+				exptypes.ExporterPlatformsKey:   platBytes,
+				"random":                        []byte("value"),
+			},
+			Refs: nil, // 我们不真正构造 cache.ImmutableRef，走空 fast-path
+		}
+
+		// 5. ImageCommitOpts（随机开关）
+		opts := &ImageCommitOpts{
+			OCITypes:                randBool(r),
+			RewriteTimestamp:        randBool(r),
+			ForceInlineAttestations: randBool(r),
+		}
+		if randBool(r) {
+			epoch := time.Unix(int64(r.Intn(1<<30)), 0).UTC()
+			opts.Epoch = &epoch
+		}
+
+		// 6. 执行
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancel()
+		_, _ = iw.Commit(ctx, src, "", nil, opts)
 	})
 }
